@@ -1,0 +1,8 @@
+model_name: klue/roberta-large
+batch_size: 64
+epochs: 1
+lr: 2e-5
+pos_weight: 3         # 1:3 불균형 보정
+max_len: 96
+
+

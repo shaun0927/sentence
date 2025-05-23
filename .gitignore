@@ -1,0 +1,63 @@
+# ───────── Python ─────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyi
+*.so
+*.dylib
+*.egg-info/
+*.dist-info/
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+
+# Virtual env & build
+.venv/
+env/
+venv/
+build/
+dist/
+pip-wheel-metadata/
+*.egg
+.Python
+
+# ───────── Data & Models ─────────
+# HF/torch caches
+.cache/
+.huggingface/
+torch_cache/
+# local model & checkpoint dirs
+models/
+first_sentence_kobert/checkpoints/
+**/checkpoints/
+**/*.ckpt
+**/*.safetensors
+**/*.bin
+**/*.gguf
+**/*.ggml
+gemma_cache.sqlite3
+
+# heavy FAISS / embedding artifacts
+data/faiss/
+*.faiss
+
+# ZIP outputs
+*.zip
+submission*.csv
+
+# ───────── Logs ─────────
+*.log
+logs/
+wandb/
+lightning_logs/
+
+# ───────── IDE ─────────
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# OS miscellany
+.DS_Store
+Thumbs.db
