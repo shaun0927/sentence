@@ -1,0 +1,13 @@
+# ❶ 필요한 모델 목록을 “models” 배열에 추가해 주세요.
+#    - name : 아무 식별자(폴더/파일명 등에 사용)
+#    - hf_id: Hugging Face 모델 ID
+#    - dtype: "float16" | "bfloat16" | "auto"
+#    - gpu_memory_utilization·max_model_len 등 vLLM 인자도 자유롭게 확장 가능
+
+models:
+  - name : gemma27b
+    hf_id: google/gemma-3-27b-it     # ☆ 지금은 이것만 사용
+    dtype: float16
+    gpu_memory_utilization: 0.85
+    max_model_len: 4096              # 필요 시 조정
+    batch_size: 4                    # 시퀀스 PPL 채점 배치
