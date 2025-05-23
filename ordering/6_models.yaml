@@ -11,3 +11,4 @@ models:
     gpu_memory_utilization: 0.85
     max_model_len: 4096              # 필요 시 조정
     batch_size: 4                    # 시퀀스 PPL 채점 배치
+    tensor_parallel_size: 2
