@@ -10,13 +10,14 @@
 #   batch        : PPL 평가 시 한 번에 넣을 문장 수
 #   remarks      : (선택) 비고
 # ─────────────────────────────────────────────────────────────
-motif_102b_bf16:
-  repo: moreh/Llama-3-Motif-102B
-  dtype: bf16
-  tp: 4                # A100 80GB × 4  → --tp 4
-  max_seq_len: 4096    # 필요하면 8192까지
-  batch: 16            # GPU 여유에 따라 8~32 조정
-  remarks: "Motif-102B, bf16, vLLM"
+
+models:
+  - name: motif_102b_bf16                # 아무 식별자
+    server_url: http://localhost:8000
+    hf_id: moreh/Llama-3-Motif-102B
+    batch_size: 1
+    gpu_memory_utilization: 0.9                
+    dtype: bfloat16                # 선택: 서버가 다른 dtype이면 맞춰 적기
 
 # 예비로 다른 모델들을 추가하고 싶다면 아래처럼 이어서 작성
 #klue_roberta_large:
