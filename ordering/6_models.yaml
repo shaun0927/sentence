@@ -1,14 +1,27 @@
-# ❶ 필요한 모델 목록을 “models” 배열에 추가해 주세요.
-#    - name : 아무 식별자(폴더/파일명 등에 사용)
-#    - hf_id: Hugging Face 모델 ID
-#    - dtype: "float16" | "bfloat16" | "auto"
-#    - gpu_memory_utilization·max_model_len 등 vLLM 인자도 자유롭게 확장 가능
+# ordering/6_models.yaml
+#
+# 여러 모델을 번갈아 채점할 수 있게 ‘리스트’ 형태로 작성합니다.
+# ─────────────────────────────────────────────────────────────
+# key            : 임의의 식별자 (알파벳·숫자·언더스코어)
+#   repo         : HF 모델 ID
+#   dtype        : bf16 | fp16 | int8 | gptq | awq …
+#   tp           : 텐서-병렬 수 (vLLM --tp)
+#   max_seq_len  : 채점용 최대 컨텍스트 길이
+#   batch        : PPL 평가 시 한 번에 넣을 문장 수
+#   remarks      : (선택) 비고
+# ─────────────────────────────────────────────────────────────
+motif_102b_bf16:
+  repo: moreh/Llama-3-Motif-102B
+  dtype: bf16
+  tp: 4                # A100 80GB × 4  → --tp 4
+  max_seq_len: 4096    # 필요하면 8192까지
+  batch: 16            # GPU 여유에 따라 8~32 조정
+  remarks: "Motif-102B, bf16, vLLM"
 
-models:
-  - name : gemma27b
-    hf_id: google/gemma-3-27b-it     # ☆ 지금은 이것만 사용
-    dtype: float16
-    gpu_memory_utilization: 0.85
-    max_model_len: 4096              # 필요 시 조정
-    batch_size: 4                    # 시퀀스 PPL 채점 배치
-    tensor_parallel_size: 2
+# 예비로 다른 모델들을 추가하고 싶다면 아래처럼 이어서 작성
+#klue_roberta_large:
+#  repo: klue/roberta-large
+#  dtype: fp16
+#  tp: 1
+#  max_seq_len: 4096
+#  batch: 64
