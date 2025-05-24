@@ -42,7 +42,8 @@ def build_first_samples(df: pd.DataFrame, out_path: pathlib.Path):
             rows.append({
                 "text":   row[f"sentence_{i}"],
                 "label":  int(i == gold_first),
-                "doc_id": int(doc_id)
+                "doc_id": int(doc_id),
+                "sent_idx": i,
             })
     random.shuffle(rows)
     _write_jsonl(rows, out_path)
@@ -91,7 +92,8 @@ def make_folds_doc(csv_path: pathlib.Path, k: int):
                 rows.append({
                     "text":   row[f"sentence_{i}"],
                     "label":  int(i == gold_first),
-                    "doc_id": int(doc_id)
+                    "doc_id": int(doc_id),
+                    "sent_idx": i,
                 })
         fp = fold_dir / f"fold_{f_idx}.jsonl"
         _write_jsonl(rows, fp)

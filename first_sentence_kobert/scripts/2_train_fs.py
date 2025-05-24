@@ -209,7 +209,7 @@ def main(args):
         results.append(m)
         print("metrics:", m)
 
-    f1s = [m["f1"] for m in results]
+    f1s = [m["eval_f1"] for m in results] 
     print(f"\n📊 {len(results)}-Fold avg F1 = {np.mean(f1s):.4f}")
     with open(ckpt_root / f"{args.exp}_cv_metrics.json", "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
