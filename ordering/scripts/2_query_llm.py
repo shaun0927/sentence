@@ -4,19 +4,26 @@
 # 두 문장 쌍 JSONL + ordering/6_models.yaml → LLM 질의 → 다수결 결과 저장
 
 import argparse, json, pathlib, re, statistics, yaml, requests
+from tqdm.auto import tqdm
 
 # ───────────── 내장 프롬프트 템플릿 ─────────────
 PROMPT_TEMPLATE = """\
+다음 네 문장은 하나의 글을 이룹니다.
+첫 문장과 마지막 문장은 이미 결정되어 있고,
+문장 A, B 두 개는 **그 사이에 들어갈 중간 문장**입니다.
+
 첫 문장: "{first_sent}"
 마지막 문장: "{last_sent}"
 
 문장 A: "{sent_a}"
 문장 B: "{sent_b}"
 
-자연스러운 순서는?
+첫 문장과 마지막 문장을 참고해 
+문장 A와 문장 B를 자연스러운 순서로 배열하세요.
 1) A → B
 2) B → A
-정답 번호만 숫자로 출력:"""
+
+정답 번호만 숫자(1 또는 2)로 출력하세요:"""
 
 # ───────────── helpers ────────────────────────
 def load_pairs(path):
@@ -71,7 +78,9 @@ def main(a):
 
         print(f"\n⚙️  {model} | batch={bs} | n_sample={n_samp}")
 
-        for i in range(0, len(pairs), bs):
+        for i in tqdm(range(0, len(pairs), bs),
+                total = (len(pairs)+bs-1)//bs,
+                desc  = m["name"]):
             batch_recs = pairs[i:i+bs]
             prompts = [render_prompt(r) for r in batch_recs]
 
