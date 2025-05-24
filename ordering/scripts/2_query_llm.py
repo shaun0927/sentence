@@ -3,7 +3,8 @@
 # ------------------------------------------------------------------
 # 두 문장 쌍 JSONL + ordering/6_models.yaml → LLM 질의 → 다수결 결과 저장
 
-import argparse, json, pathlib, re, statistics, yaml, requests
+
+import argparse, json, pathlib, re, statistics, random, yaml, requests
 from tqdm.auto import tqdm
 
 # ───────────── 내장 프롬프트 템플릿 ─────────────
@@ -30,7 +31,7 @@ PROMPT_TEMPLATE = """\
 def load_pairs(path):
     return [json.loads(l) for l in pathlib.Path(path).read_text("utf-8").splitlines()]
 
-def render_prompt(rec: dict) -> str:
+def render_prompt(rec):
     return PROMPT_TEMPLATE.format(
         first_sent = rec["first_sent"],
         last_sent  = rec["last_sent"],
@@ -38,18 +39,20 @@ def render_prompt(rec: dict) -> str:
         sent_b     = rec["sent_b"],
     )
 
-# robust majority
-def majority(lst):
+def majority_numeric(votes):
+    """빈칸(None) 제외 후 다수결, 동률이면 임의 선택."""
+    numeric = [v for v in votes if v in ("1", "2")]
+    if not numeric:
+        return None
     try:
-        return statistics.mode(lst)
-    except statistics.StatisticsError:
-        return lst[0] if lst else "1"
+        return statistics.mode(numeric)
+    except statistics.StatisticsError:      # tie
+        return random.choice(numeric)
 
-# extract \boxed{1} or 2
-boxed_pat   = re.compile(r"\\boxed\{\s*([12])\s*\}")
-backup_pat  = re.compile(r"\b([12])\b")
+boxed_pat  = re.compile(r"\\boxed\{\s*([12])\s*\}")
+backup_pat = re.compile(r"\b([12])\b")
 
-def extract_final(text: str):
+def extract_final(text):
     if m := boxed_pat.search(text):
         return m.group(1)
     if m := backup_pat.search(text.strip()):
@@ -61,7 +64,7 @@ def call_llm(server, model, prompts, n, temp, top_p, timeout=120):
     body = {
         "model": model,
         "prompt": prompts if len(prompts) > 1 else prompts[0],
-        "max_tokens": 5,
+        "max_tokens": 30,
         "temperature": temp,
         "top_p": top_p,
         "n": n,
@@ -72,24 +75,26 @@ def call_llm(server, model, prompts, n, temp, top_p, timeout=120):
     blocks = data if isinstance(data, list) else [data]
     return [[c["text"] for c in blk["choices"]] for blk in blocks]
 
-# 한 쌍에 대해: self-consistency + 재시도
+# ───────── retry / self-consistency ───────────
 MAX_RETRY = 8
 
 def query_one(server, model, prompt, n, temp, top_p):
-    # 1차: temp/high-n
+    # ① self-consistency
     replies = call_llm(server, model, [prompt], n, temp, top_p)[0]
-    votes   = [extract_final(r) for r in replies if extract_final(r)]
-    if votes:
-        return majority(votes), votes
+    votes   = [extract_final(r) for r in replies]
+    choice  = majority_numeric(votes)
+    if choice:
+        return choice, [v for v in votes if v]
 
-    # 재시도: 결정적(temp 0) 단건
+    # ② deterministic 재시도
     for _ in range(MAX_RETRY):
         txt = call_llm(server, model, [prompt], 1, 0.0, 1.0)[0][0]
         v = extract_final(txt)
         if v:
             return v, [v]
-    # 끝까지 실패 → default 1
-    return "1", []
+
+    # ③ 완전 실패 → None
+    return None, []
 
 # ───────────── main ───────────────────────────
 def main(a):
@@ -101,8 +106,8 @@ def main(a):
         name   = m["name"]
         model  = m["hf_id"]
         server = m["server_url"]
-        bs     = int(m.get("batch_size", 1))   # n_sample 크면 batch 1 권장
-        n_samp = int(m.get("n_sample", 1))
+        bs     = int(m.get("batch_size", 1))
+        n_samp = int(m.get("n_sample", 3))
         temp   = float(m.get("temperature", 0.7))
         top_p  = float(m.get("top_p", 0.9))
 
@@ -112,43 +117,46 @@ def main(a):
                       total=(len(pairs)+bs-1)//bs,
                       desc=name):
             batch_recs = pairs[i:i+bs]
-            prompts = [render_prompt(r) for r in batch_recs]
+            prompts    = [render_prompt(r) for r in batch_recs]
 
-            # vLLM 는 prompt 개수 = len(prompts)
             try:
-                batch_votes = call_llm(server, model, prompts,
+                batch_texts = call_llm(server, model, prompts,
                                        n_samp, temp, top_p)
             except Exception as e:
                 print("❗ 배치 호출 실패:", e)
-                batch_votes = [[""]*n_samp for _ in prompts]
+                batch_texts = [[""]*n_samp for _ in prompts]
 
-            for rec, texts, prompt in zip(batch_recs, batch_votes, prompts):
-                votes = [extract_final(t) for t in texts if extract_final(t)]
-                if not votes:                       # 재시도
+            for rec, texts, prompt in zip(batch_recs, batch_texts, prompts):
+                votes   = [extract_final(t) for t in texts]
+                choice  = majority_numeric(votes)
+
+                if choice is None:                  # 전부 빈칸 → 재시도
                     choice, votes = query_one(server, model, prompt,
                                               n_samp, temp, top_p)
-                else:
-                    choice = majority(votes)
 
-                order_mid = ([rec["idx_a"], rec["idx_b"]] if choice == "1"
-                             else [rec["idx_b"], rec["idx_a"]])
+                if choice is None:
+                    order_mid = None               # 끝까지 실패
+                else:
+                    order_mid = ([rec["idx_a"], rec["idx_b"]]
+                                 if choice == "1"
+                                 else [rec["idx_b"], rec["idx_a"]])
 
                 out_lines.append(json.dumps({
                     "ID": rec["ID"],
-                    "order_mid": order_mid,
-                    "votes": votes,
+                    "order_mid": order_mid,         # null 은 후단계에서 처리
+                    "votes": [v for v in votes if v],
                     "model": name
                 }, ensure_ascii=False))
 
-    out = pathlib.Path(a.out_jsonl)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("\n".join(out_lines), encoding="utf-8")
-    print("✅ votes saved →", out)
+    out_path = pathlib.Path(a.out_jsonl)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(out_lines), encoding="utf-8")
+    print("✅ votes saved →", out_path)
 
 # ───────────── CLI ────────────────────────────
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--pairs_jsonl", required=True)
-    p.add_argument("--models_yaml", default="ordering/6_models.yaml")
-    p.add_argument("--out_jsonl",   required=True)
-    main(p.parse_args())
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pairs_jsonl", required=True)
+    ap.add_argument("--models_yaml", default="ordering/6_models.yaml")
+    ap.add_argument("--out_jsonl",   required=True)
+    main(ap.parse_args())
