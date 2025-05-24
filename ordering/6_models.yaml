@@ -16,7 +16,10 @@ models:
     server_url: http://localhost:8000
     hf_id: moreh/Llama-3-Motif-102B
     batch_size: 1
-    gpu_memory_utilization: 0.9                
+    gpu_memory_utilization: 0.9
+    n_sample: 32                        # ★ self-consistency 샘플 수
+    temperature: 0.7                    # ★ 0.6~0.8 권장
+    top_p: 0.9               
     dtype: bfloat16                # 선택: 서버가 다른 dtype이면 맞춰 적기
 
 # 예비로 다른 모델들을 추가하고 싶다면 아래처럼 이어서 작성
