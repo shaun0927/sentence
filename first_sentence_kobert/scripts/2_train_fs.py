@@ -32,13 +32,41 @@ def set_seed(seed: int = SEED):
 
 
 # ─────────────────────── metric 함수 ───────────────────────────────
-def compute_metrics(pred):
-    y_true, y_pred = pred.label_ids, pred.predictions.argmax(-1)
+def compute_metrics(pred, k=2):
+    y_true = pred.label_ids
+    logits = pred.predictions          # [N, 2]
+
+    # ── Top-1 F1 기존 계산 ─────────────────────────
+    y_pred = logits.argmax(-1)
     p, r, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, average="binary", zero_division=0
     )
-    return {"accuracy": accuracy_score(y_true, y_pred),
-            "precision": p, "recall": r, "f1": f1}
+
+    # ── Hit@2 계산 ────────────────────────────────
+    # 확률이 양성일 top-2 문장 기준이 아니라,
+    # "첫 문장일 확률" 값 상위 k 에 정답(라벨=1)이 있나?
+    probs_first = torch.softmax(torch.tensor(logits), dim=-1)[:, 1].numpy()
+
+    # 그룹(문서)별로 top-k 보기 → 여기선 배치가 문서 섞여 있으니
+    # valid 데이터셋이 문서 단위 4문장씩 순서대로라는 전제를 사용
+    hit2, mrr2 = 0, 0.0
+    for i in range(0, len(y_true), 4):
+        idx = slice(i, i+4)
+        topk = probs_first[idx].argsort()[::-1][:k]
+        labels4 = y_true[idx]
+        # 정답 위치
+        rank = np.where(labels4[topk] == 1)[0]
+        if rank.size:                 # 성공
+            hit2 += 1
+            mrr2 += 1.0 / (rank[0] + 1)   # rank[0]=0 → 1.0
+    n_docs = len(y_true) // 4
+
+    return {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "precision": p, "recall": r, "f1": f1,
+        "hit@2": hit2 / n_docs,
+        "mrr@2": mrr2 / n_docs,
+    }
 
 
 # ───────────────── strategy 키 자동 감지 ────────────────────────────
