@@ -1,0 +1,11 @@
+# first_sentence_kobert/cfg/pair_roberta.yaml
+# ──────────────────────────────────────────
+model_name: klue/roberta-large        # cross-encoder에 쓸 HuggingFace 모델
+max_len: 128                          # 두 문장 합쳐 토큰 128개 이내
+batch_size: 32                        # GPU·메모리에 맞춰 조정
+epochs: 3                             # fold마다 학습 epoch
+lr: 5e-6                              # AdamW learning rate
+warmup_steps: 0                       # 필요 없으면 0
+weight_decay: 0.01                    # 선택
+pos_weight: 1.0                       # class imbalance가 약하면 1.0
+seed: 42                              # 재현용
