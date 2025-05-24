@@ -1,14 +1,15 @@
 #!/usr/bin/env python
 """
 3_eval_fs.py
-------------
-*폴드별* checkpoint 를 모두 순회하여
- - 각 fold-valid 에 대해 예측
- - OOF 메트릭(F1·정확도 등) 계산
- - oof_proba / oof_pred csv 저장
+────────────
+• *_fold*/best 체크포인트를 순회하며 각 fold-valid를 예측
+• OOF 확률·라벨·메타데이터를 저장
+      oof_prob.npy   : (N, 2) float32
+      oof_label.npy  : (N,)   int8
+      oof_meta.npy   : (N, 2) int32   ← [doc_id, sent_idx]
 """
 
-import argparse, json, pathlib, torch, numpy as np, yaml
+import argparse, json, pathlib, sys, numpy as np, torch
 from tqdm.auto import tqdm
 from datasets import load_dataset
 from transformers import (AutoTokenizer, AutoModelForSequenceClassification,
@@ -16,92 +17,90 @@ from transformers import (AutoTokenizer, AutoModelForSequenceClassification,
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SEED   = 42
-torch.manual_seed(SEED)
+torch.set_grad_enabled(False)
 
-
-# ──────────────────── metric util ──────────────────────
-def metrics(y_true, y_prob):
+# ────────────────── metric util ────────────────────
+def metric_dict(y_true, y_prob):
     y_pred = (y_prob[:, 1] > 0.5).astype(int)
     p, r, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, average="binary", zero_division=0)
-    return {
-        "accuracy": accuracy_score(y_true, y_pred),
-        "precision": p, "recall": r, "f1": f1,
-    }
+    return {"accuracy": accuracy_score(y_true, y_pred),
+            "precision": p, "recall": r, "f1": f1}
 
+# ───────────────────── main ─────────────────────────
+def main(a):
+    ck_root = pathlib.Path(a.ckpt_dir)
+    ck_dirs = sorted(ck_root.glob("*_fold*/best"))
+    if not ck_dirs:
+        sys.exit(f"[ERR] no *_fold*/best found under {ck_root}")
+    print("▶ detected", len(ck_dirs), "fold checkpoints")
 
-# ──────────────────── main ─────────────────────────────
-def main(args):
-    ckpt_root = pathlib.Path(args.ckpt_dir)
-    fold_ckpts = sorted(ckpt_root.glob("*_fold*/best"))
-    assert fold_ckpts, f"no fold checkpoints found under {ckpt_root}"
-    print("▶ detected", len(fold_ckpts), "fold checkpoints")
+    fold_dir = pathlib.Path(a.fold_dir)
+    out_dir  = pathlib.Path(a.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
 
-    fold_dir  = pathlib.Path(args.fold_dir)
-    out_dir   = pathlib.Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    all_prob, all_lbl, all_meta, per_fold = [], [], [], []
 
-    all_oof_prob, all_oof_label = [], []
-    per_fold_scores            = []
+    # ─────────── fold loop ───────────
+    for ckpt in ck_dirs:
+        fidx = int(ckpt.parent.name.split("_fold")[-1])
+        vfile = fold_dir / f"fold_{fidx}.jsonl"
+        if not vfile.exists():
+            sys.exit(f"[ERR] {vfile} missing")
 
-    for ckpt in fold_ckpts:
-        fold_idx = int(ckpt.parent.name.split("_fold")[-1])
-        valid_file = fold_dir / f"fold_{fold_idx}.jsonl"
-        assert valid_file.exists(), f"missing {valid_file}"
-
-        tok   = AutoTokenizer.from_pretrained(ckpt, use_fast=False)
-        model = AutoModelForSequenceClassification.from_pretrained(
-                    ckpt).to(DEVICE).eval()
+        tok = AutoTokenizer.from_pretrained(ckpt, use_fast=False)
+        model = AutoModelForSequenceClassification.from_pretrained(ckpt).to(DEVICE).eval()
         trainer = Trainer(model=model, tokenizer=tok)
 
-        # ── valid dataset ───────────────────────────────
-        valid_ds = load_dataset("json", data_files=str(valid_file))["train"]
+        # ── valid 데이터 ───────────────────────────
+        vds = load_dataset("json", data_files=str(vfile))["train"]
         def _enc(ex): return tok(ex["text"], truncation=True,
-                                  max_length=128, return_tensors=None)
-        valid_ds = valid_ds.map(_enc, batched=True)
+                                 max_length=128, return_tensors=None)
+        vds = vds.map(_enc, batched=True)
 
-        # ── inference ───────────────────────────────────
-        preds = []
-        for chunk in tqdm(np.array_split(range(len(valid_ds)), 
-                                         max(1, len(valid_ds)//1024)),
-                          desc=f"fold{fold_idx}", leave=False):
-            outputs = trainer.predict(valid_ds.select(chunk))
-            preds.append(outputs.predictions)   # [N,2]
-        prob = np.concatenate(preds, 0)
-        label = np.array(valid_ds["label"])
+        # ── inference ─────────────────────────────
+        prob_chunks = []
+        idx_splits = np.array_split(np.arange(len(vds)),
+                                    max(1, len(vds)//1024))
+        for idx in tqdm(idx_splits, desc=f"fold{fidx}", leave=False):
+            prob_chunks.append(trainer.predict(vds.select(idx)).predictions)
+        prob = np.concatenate(prob_chunks, 0)        # (n,2) logits
+        lbl  = np.asarray(vds["label"],   dtype=np.int8)
+        did  = np.asarray(vds["doc_id"],  dtype=np.int32)
+        sid  = np.asarray(vds.get("sent_idx",
+                   np.tile([0,1,2,3], len(did)//4)), dtype=np.int32)  # fallback
 
-        all_oof_prob.append(prob)
-        all_oof_label.append(label)
+        # ── 기록 ──────────────────────────────────
+        all_prob.append(prob); all_lbl.append(lbl)
+        all_meta.append(np.vstack([did, sid]).T)
 
-        sc = metrics(label, prob)
-        sc["fold"] = fold_idx
-        per_fold_scores.append(sc)
-        print(f"fold {fold_idx} F1={sc['f1']:.4f}")
+        sc = metric_dict(lbl, prob); sc["fold"] = fidx
+        per_fold.append(sc); print(f"fold {fidx} F1={sc['f1']:.4f}")
 
-    # ── aggregate OOF ───────────────────────────────────
-    oof_prob   = np.concatenate(all_oof_prob,   0)
-    oof_label  = np.concatenate(all_oof_label,  0)
-    overall_sc = metrics(oof_label, oof_prob)
+    # ─────────── aggregate & save ───────────
+    oof_prob  = np.concatenate(all_prob, 0).astype(np.float32)
+    oof_label = np.concatenate(all_lbl,  0).astype(np.int8)
+    oof_meta  = np.concatenate(all_meta, 0).astype(np.int32)
+
+    np.save(out_dir/"oof_prob.npy",  oof_prob)
+    np.save(out_dir/"oof_label.npy", oof_label)
+    np.save(out_dir/"oof_meta.npy",  oof_meta)
+
+    overall = metric_dict(oof_label, oof_prob)
     print("\n📊 OOF summary:",
-          ", ".join(f"{k}={v:.4f}" for k, v in overall_sc.items()))
+          ", ".join(f"{k}={v:.4f}" for k,v in overall.items()))
 
-    # ── save ────────────────────────────────────────────
-    np.save(out_dir / "oof_prob.npy",  oof_prob)
-    np.save(out_dir / "oof_label.npy", oof_label)
-    with open(out_dir / "oof_metrics.json", "w", encoding="utf-8") as f:
-        json.dump({"fold_scores": per_fold_scores,
-                   "overall": overall_sc}, f, ensure_ascii=False, indent=2)
-    print("✅ saved OOF outputs to", out_dir)
+    with open(out_dir/"oof_metrics.json", "w", encoding="utf-8") as f:
+        json.dump({"fold_scores": per_fold, "overall": overall},
+                  f, indent=2, ensure_ascii=False)
+    print("✅ saved OOF files to", out_dir)
 
-
-# ──────────────────── CLI ──────────────────────────────
+# ───────────────────── CLI ───────────────────────────
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt_dir", required=True,
-                    help="parent dir that contains *_fold*/best checkpoints")
-    ap.add_argument("--fold_dir", required=True,
-                    help="data/fold/  (fold_0.jsonl …)")
-    ap.add_argument("--out_dir",  default="data/proc",
-                    help="directory to write oof_* files")
-    main(ap.parse_args())
+    p = argparse.ArgumentParser()
+    p.add_argument("--ckpt_dir", required=True,
+                   help="parent dir containing *_fold*/best/")
+    p.add_argument("--fold_dir", required=True,
+                   help="fold_0.jsonl … fold_k.jsonl location")
+    p.add_argument("--out_dir", default="data/proc",
+                   help="directory to write OOF files")
+    main(p.parse_args())
