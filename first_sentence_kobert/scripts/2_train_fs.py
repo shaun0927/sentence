@@ -3,11 +3,15 @@
 2_train_fs.py
 -------------
 KoBERT 첫 문장(binary) 분류기 파인튜닝
-  • 단일 학습        : 기본 (--train / --valid 지정)
-  • 5-Fold CV 학습   : --cv --fold_dir data/fold  (fold_0.jsonl … fold_4.jsonl)
+  • 단일 학습 (--train / --valid)
+  • K-Fold CV  (--cv  --fold_dir data/fold)  ← fold_0.jsonl … fold_N.jsonl
+     ↳ 검증 문서가 학습 세트에 섞이지 않도록 누수 차단
 """
+import argparse, yaml, pathlib, random, os, json, inspect
+from typing import Optional, Set, List
 
-import argparse, yaml, pathlib, random, os, numpy as np, inspect, json, torch
+import numpy as np
+import torch
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer, AutoModelForSequenceClassification,
@@ -15,19 +19,19 @@ from transformers import (
 )
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
-# ───────────────────────────── 기본 설정 ─────────────────────────────
+# ─────────────────────── 기본 설정 ─────────────────────────────────
 SEED = 42
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def set_seed(seed=SEED):
+def set_seed(seed: int = SEED):
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 
-# ──────────────────────── metric 함수 ────────────────────────────────
+# ─────────────────────── metric 함수 ───────────────────────────────
 def compute_metrics(pred):
     y_true, y_pred = pred.label_ids, pred.predictions.argmax(-1)
     p, r, f1, _ = precision_recall_fscore_support(
@@ -37,7 +41,7 @@ def compute_metrics(pred):
             "precision": p, "recall": r, "f1": f1}
 
 
-# ─────────────────────── strategy 키 자동 감지 ───────────────────────
+# ───────────────── strategy 키 자동 감지 ────────────────────────────
 def pick_param(long: str, short: str) -> str:
     params = inspect.signature(TrainingArguments.__init__).parameters
     return long if long in params else short
@@ -48,7 +52,7 @@ STRAT_SAVE = pick_param("save_strategy",        "save_steps")
 STRAT_LOG  = pick_param("logging_strategy",     "logging_steps")
 
 
-# ────────────────────────── Trainer 서브클래스 ───────────────────────
+# ─────────────────────── Trainer 확장 (가중치 CE) ──────────────────
 class WeightedCETrainer(Trainer):
     def __init__(self, class_weight, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -61,27 +65,38 @@ class WeightedCETrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
 
-# ────────────────────────── 학습 함수 ────────────────────────────────
-def train_once(cfg: dict, train_path: str, valid_path: str, exp_path: pathlib.Path):
+# ─────────────────────── 학습 1회 함수 ──────────────────────────────
+def train_once(cfg: dict,
+               train_path: str,
+               valid_path: str,
+               exp_path: pathlib.Path,
+               exclude_texts: Optional[Set[str]] = None):
+    """
+    exclude_texts : 학습 세트에서 제거할 문장 set (누수 차단용)
+    """
     set_seed()
-
     tok = AutoTokenizer.from_pretrained(cfg["model_name"], use_fast=False)
     model = AutoModelForSequenceClassification.from_pretrained(
         cfg["model_name"], num_labels=2
     ).to(device)
 
+    # ── 데이터 로드 & 전처리 ───────────────────────────────────────
     def encode(ex):
-        return tok(ex["text"], truncation=True,
+        return tok(ex["text"],
+                   truncation=True,
                    max_length=cfg.get("max_len", 96),
                    return_token_type_ids=False)
 
-    ds_train = load_dataset("json", data_files=train_path)["train"] \
-               .shuffle(seed=SEED).map(encode, batched=True)
+    raw_train = load_dataset("json", data_files=train_path)["train"]
+    if exclude_texts:
+        raw_train = raw_train.filter(lambda ex: ex["text"] not in exclude_texts)
+
+    ds_train = raw_train.shuffle(seed=SEED).map(encode, batched=True)
     ds_valid = load_dataset("json", data_files=valid_path)["train"] \
                .map(encode, batched=True)
 
+    # ── 학습 준비 ─────────────────────────────────────────────────
     exp_path.mkdir(parents=True, exist_ok=True)
-
     train_args = TrainingArguments(
         output_dir=str(exp_path),
         per_device_train_batch_size=cfg["batch_size"],
@@ -122,63 +137,71 @@ def train_once(cfg: dict, train_path: str, valid_path: str, exp_path: pathlib.Pa
     return metrics, best_dir
 
 
-# ────────────────────────── main ────────────────────────────────────
+# ───────────────────────────── main ────────────────────────────────
 def main(args):
     cfg = yaml.safe_load(open(args.cfg, encoding="utf-8"))
     if args.epochs:
         cfg["epochs"] = args.epochs
 
-    checkpoints_root = pathlib.Path("first_sentence_kobert/checkpoints")
+    ckpt_root = pathlib.Path("first_sentence_kobert/checkpoints")
 
-    # ── 1) 단일 학습 ────────────────────────────────────────────────
+    # ── 단일 학습 모드 ────────────────────────────────────────────
     if not args.cv:
-        exp_path = checkpoints_root / args.exp
+        exp_path = ckpt_root / args.exp
         metrics, best_dir = train_once(cfg, args.train, args.valid, exp_path)
         print("✅ Single run finished:", json.dumps(metrics, indent=2, ensure_ascii=False))
         print("Best model saved ->", best_dir)
         return
 
-    # ── 2) 5-Fold CV ───────────────────────────────────────────────
+    # ── K-Fold CV 모드 ───────────────────────────────────────────
     fold_dir = pathlib.Path(args.fold_dir)
-    results = []
+    fold_files: List[pathlib.Path] = sorted(fold_dir.glob("fold_*.jsonl"))
+    assert fold_files, f"{fold_dir} 에 fold_*.jsonl 이 없습니다."
+    K = len(fold_files)
+    print(f"▶ Detected {K} fold files")
 
-    for k in range(5):
-        valid_file = fold_dir / f"fold_{k}.jsonl"
-        if not valid_file.exists():
-            raise FileNotFoundError(valid_file)
-        exp_path = checkpoints_root / f"{args.exp}_fold{k}"
+    results = []
+    for k, valid_file in enumerate(fold_files):
+        # ── 누수 차단용 exclude set ────────────────────────────
+        valid_ds = load_dataset("json", data_files=str(valid_file))["train"]
+        exclude_set = set(valid_ds["text"])
+
+        exp_path = ckpt_root / f"{args.exp}_fold{k}"
         print(f"\n─── Fold {k} training ───")
-        m, _ = train_once(cfg, args.train, str(valid_file), exp_path)
+        m, _ = train_once(cfg,
+                          train_path=args.train,
+                          valid_path=str(valid_file),
+                          exp_path=exp_path,
+                          exclude_texts=exclude_set)
         m["fold"] = k
         results.append(m)
         print(f"Fold {k} metrics:", m)
 
-    # 평균/표준편차 요약
     f1s = [m["eval_f1"] for m in results]
-    print("\n📊 5-Fold CV summary:  avg F1 = %.4f  ±  %.4f" %
-          (np.mean(f1s), np.std(f1s)))
-    # 저장
-    with open(checkpoints_root / f"{args.exp}_cv_metrics.json", "w", encoding="utf-8") as f:
+    print(f"\n📊 {K}-Fold CV summary:  avg F1 = {np.mean(f1s):.4f}  ±  {np.std(f1s):.4f}")
+
+    with open(ckpt_root / f"{args.exp}_cv_metrics.json", "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
     print("Metrics logged to", f.name)
 
 
-# ────────────────────────── CLI ─────────────────────────────────────
+# ───────────────────────────── CLI ────────────────────────────────
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--train", required=True, help="fs_train.jsonl")
-    p.add_argument("--valid", required=False, help="single-run valid jsonl")
-    p.add_argument("--cfg",   required=True)
-    p.add_argument("--exp",   required=True)
+    p.add_argument("--train", required=True, help="fs_train.jsonl (전체)")
+    p.add_argument("--valid", help="single-run valid jsonl")
+    p.add_argument("--cfg",   required=True, help="yaml config")
+    p.add_argument("--exp",   required=True, help="experiment name")
     p.add_argument("--epochs", type=int, help="override epochs")
+
     # CV 옵션
-    p.add_argument("--cv", action="store_true", help="enable 5-fold training")
+    p.add_argument("--cv", action="store_true",
+                   help="enable K-Fold cross-validation (fold_*.jsonl 자동 탐색)")
     p.add_argument("--fold_dir", default="data/fold",
-                   help="directory containing fold_0.jsonl … fold_4.jsonl")
+                   help="directory containing fold_0.jsonl … fold_N.jsonl")
     args = p.parse_args()
 
     if args.cv:
-        # valid 인자 필요 없음
         assert pathlib.Path(args.fold_dir).is_dir(), "--fold_dir 경로가 존재하지 않습니다."
     else:
         if not args.valid:
