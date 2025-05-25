@@ -1,149 +1,155 @@
 #!/usr/bin/env python
 # ordering/scripts/2_query_llm_b.py
-# ------------------------------------------------------------------
-# pairs.jsonl + 6_models.yaml → votes.jsonl  (order_all 길이 4)
-
-import argparse, json, pathlib, re, statistics, random, itertools, yaml, requests
+# -------------------------------------------------------------
+# 4-문장 전체 순열(24) → LLM self-consistency   편향 최소화 버전
+#
+#   python 2_query_llm_b.py --pairs_jsonl ordering/data/pairs/test_all4_pairs.jsonl --out_jsonl ordering/data/votes/test_all4_votes.jsonl
+# -------------------------------------------------------------
+import argparse, json, pathlib, random, re, statistics, itertools
+import yaml, requests
 from tqdm.auto import tqdm
 
-"""
-python ordering/scripts/2_query_llm_b.py --pairs_jsonl ordering/data/pairs/test_all4_pairs.jsonl --out_jsonl  ordering/data/votes/test_all4_votes.jsonl
-"""
+# ───────────────────────────────── 프롬프트 ────────────────────────────────
+BASE_TEMPLATE = """\
+아래 네 문장은 하나의 글을 이룹니다. 문장 {L1},{L2},{L3},{L4} 를
+가장 자연스러운 순서(앞→뒤)로 배열하세요.
 
-# ───── 프롬프트 템플릿 ──────────────────────────────────────────────
-PROMPT_TEMPLATE = """\
-다음 네 문장은 하나의 글을 이룹니다. 문장 A, B, C, D 네 개를
-자연스러운 순서로 배열하세요.
+문장 {L1}: "{S1}"
+문장 {L2}: "{S2}"
+문장 {L3}: "{S3}"
+문장 {L4}: "{S4}"
 
-문장 A: "{sent_a}"
-문장 B: "{sent_b}"
-문장 C: "{sent_c}"
-문장 D: "{sent_d}"
-
-가능한 배열은 아래 24가지입니다.
-1) A → B → C → D
-2) A → B → D → C
-3) A → C → B → D
-4) A → C → D → B
-5) A → D → B → C
-6) A → D → C → B
-7) B → A → C → D
-8) B → A → D → C
-9) B → C → A → D
-10) B → C → D → A
-11) B → D → A → C
-12) B → D → C → A
-13) C → A → B → D
-14) C → A → D → B
-15) C → B → A → D
-16) C → B → D → A
-17) C → D → A → B
-18) C → D → B → A
-19) D → A → B → C
-20) D → A → C → B
-21) D → B → A → C
-22) D → B → C → A
-23) D → C → A → B
-24) D → C → B → A
-
-정답을 \\boxed{{{{번호}}}} 한 줄로만 출력하세요.
-첫 토큰은 반드시 \\boxed{{ 로 시작해야 합니다. 
-(가능한 정답은 정수이며, 1~24 범위)
-
-예) A → B → D → C 이면 \\boxed{{{{2}}}}
+정답을 {L1}{L2}{L3}{L4} • {L1}{L2}{L4}{L3} … 과 같이
+{L1}{L2}{L3}{L4},{L1}{L2}{L4}{L3}, … ,{L4}{L3}{L2}{L1}
+***4글자 문자열*** 로 한 줄만 출력하세요.
+(예: {L2}{L1}{L3}{L4})
 """
 
-# ───── util ────────────────────────────────────────────────────────
+PERM_4 = [''.join(p) for p in itertools.permutations("ABCD")]
+
+perm_pat = re.compile(r"\b([ABCD]{4})\b")
+
+# ───────────────────────────── util 함수 ───────────────────────────────────
 def load_pairs(path):
     return [json.loads(l) for l in pathlib.Path(path).read_text("utf-8").splitlines()]
 
-def render_prompt(r):              # str.format 삽입
-    return PROMPT_TEMPLATE.format(
-        sent_a=r["sent_a"], sent_b=r["sent_b"],
-        sent_c=r["sent_c"], sent_d=r["sent_d"]
-    )
+def build_prompt(rec, lbl_order):
+    """lbl_order=['C','A','D','B'] 처럼 임의 순서"""
+    lbl_map = dict(zip(lbl_order, "ABCD"))      # 실제→고정
+    sents = {l: rec[f"sent_{lbl_map[l].lower()}"] for l in lbl_order}
+    return BASE_TEMPLATE.format(
+        L1=lbl_order[0], L2=lbl_order[1],
+        L3=lbl_order[2], L4=lbl_order[3],
+        S1=sents[lbl_order[0]],
+        S2=sents[lbl_order[1]],
+        S3=sents[lbl_order[2]],
+        S4=sents[lbl_order[3]],
+    ), lbl_map
 
-boxed_pat  = re.compile(r"\\boxed\{\s*([1-9]|1[0-9]|2[0-4])\s*\}")
-backup_pat = re.compile(r"\b([1-9]|1[0-9]|2[0-4])\b")
-
-def extract_num(txt):
-    if m := boxed_pat.search(txt):
-        return m.group(1)
-    if m := backup_pat.search(txt.strip()):
-        return m.group(1)
-    return None
+def extract_ans(txt):
+    m = perm_pat.search(txt.strip())
+    return m.group(1) if m and m.group(1) in PERM_4 else None
 
 def majority(votes):
-    nums = [v for v in votes if v]
-    if not nums:
+    valid = [v for v in votes if v]
+    if not valid:
         return None
     try:
-        return statistics.mode(nums)
-    except statistics.StatisticsError:
-        return random.choice(nums)
+        return statistics.mode(valid)
+    except statistics.StatisticsError:          # tie
+        return random.choice(valid)
 
-# 번호 → 인덱스 배열 매핑
-PERMS = list(itertools.permutations("ABCD"))
-ORDER_MAP = {str(i+1): p for i, p in enumerate(PERMS)}   # '1'~'24'
-
-def order_from_choice(choice, rec):
-    letter2idx = {"A": rec["idx_a"], "B": rec["idx_b"],
-                  "C": rec["idx_c"], "D": rec["idx_d"]}
-    return [letter2idx[ch] for ch in ORDER_MAP[choice]]
-
-# LLM 호출
 def call_llm(server, model, prompts, n, temp, top_p, timeout=120):
-    url  = server.rstrip("/") + "/v1/completions"
-    body = {"model": model, "prompt": prompts if len(prompts)>1 else prompts[0],
-            "max_tokens": 40, "temperature": temp, "top_p": top_p, "n": n}
-    return requests.post(url, json=body, timeout=timeout).json()
-
-def texts_from_resp(resp):
-    blocks = resp if isinstance(resp, list) else [resp]
+    body = {
+        "model": model,
+        "prompt": prompts if len(prompts) > 1 else prompts[0],
+        "max_tokens": 12,
+        "temperature": temp,
+        "top_p": top_p,
+        "n": n,
+    }
+    url = server.rstrip("/") + "/v1/completions"
+    r   = requests.post(url, json=body, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    blocks = data if isinstance(data, list) else [data]
     return [[c["text"] for c in blk["choices"]] for blk in blocks]
 
-# ───── main ────────────────────────────────────────────────────────
+def order_from_str(order_str, lbl_map, rec):
+    """order_str 예: 'CADB' → 원본 인덱스 순서(list[int])"""
+    letter2idx = {"A": rec["idx_a"], "B": rec["idx_b"],
+                  "C": rec["idx_c"], "D": rec["idx_d"]}
+    # order_str 은 무작위 라벨을 그대로 사용 → lbl_map 로 변환
+    canonical = ''.join(lbl_map[ch] for ch in order_str)
+    return [letter2idx[ch] for ch in canonical]
+
+# ─────────────────────────────── main ─────────────────────────────────────
 def main(a):
     models = yaml.safe_load(open(a.models_yaml, encoding="utf-8"))["models"]
     pairs  = load_pairs(a.pairs_jsonl)
 
-    out=[]
+    out_lines = []
     for m in models:
-        name, model, server = m["name"], m["hf_id"], m["server_url"]
-        bs = int(m.get("batch_size",1)); n = int(m.get("n_sample",5))
-        temp=float(m.get("temperature",0.7)); top_p=float(m.get("top_p",0.9))
+        name = m["name"]; model = m["hf_id"]; server = m["server_url"]
+        bs = int(m.get("batch_size", 1))
+        n_sample = int(m.get("n_sample", 32))
+        n_view   = int(m.get("n_view",   5))      # 라벨 무작위 view 수
+        temp = float(m.get("temperature", 0.8)); top_p = float(m.get("top_p", 0.9))
 
-        print(f"\n⚙️ {model} | batch={bs} | n_sample={n}")
-        for i in tqdm(range(0,len(pairs),bs),
-                      total=(len(pairs)+bs-1)//bs, desc=name):
-            chunk = pairs[i:i+bs]
-            prompts=[render_prompt(r) for r in chunk]
-            try:
-                resp = call_llm(server,model,prompts,n,temp,top_p)
-                batch_txt = texts_from_resp(resp)
-            except Exception as e:
-                print("❗ 호출 실패:",e); batch_txt=[[""]*n for _ in prompts]
+        print(f"\n⚙️ {model} | batch={bs} | n_sample={n_sample} | view={n_view}")
+        for i in tqdm(range(0, len(pairs), bs),
+                      total=(len(pairs) + bs - 1)//bs,
+                      desc=name):
+            batch_recs = pairs[i:i+bs]
 
-            for rec, txts in zip(chunk, batch_txt):
-                votes=[extract_num(t) for t in txts]
-                choice=majority(votes)
-                order_all=order_from_choice(choice,rec) if choice else None
+            # view 별 프롬프트 생성
+            prompts, view_maps = [], []
+            for rec in batch_recs:
+                for v in range(n_view):
+                    lbl_order = random.sample("ABCD", 4)
+                    ptxt, mp = build_prompt(rec, lbl_order)
+                    prompts.append(ptxt)
+                    view_maps.append((rec, mp))
 
-                out.append(json.dumps({
-                    "ID":rec["ID"],
-                    "order_all":order_all,   # [idx0,idx1,idx2,idx3] 또는 null
-                    "votes":[v for v in votes if v],
-                    "model":name
+            # LLM 호출 (view*bs 개)
+            reps = call_llm(server, model, prompts,
+                            n_sample, temp, top_p)
+            # 납작 리스트로 정렬
+            flat_reps = [t for sub in reps for t in sub]
+
+            # 결과 집계
+            ptr = 0
+            for rec in batch_recs:
+                votes = []
+                for _ in range(n_view):
+                    ans_list = flat_reps[ptr: ptr + n_sample]
+                    rec_, mp = view_maps[ptr // n_sample]
+                    ptr += n_sample
+                    for txt in ans_list:
+                        s = extract_ans(txt)
+                        if s:
+                            votes.append(order_from_str(s, mp, rec_))
+                # Canonical tuple 로 majority
+                vote_strs = ['-'.join(map(str, v)) for v in votes]
+                best = majority(vote_strs)
+                order_all = list(map(int, best.split('-'))) if best else None
+
+                out_lines.append(json.dumps({
+                    "ID": rec["ID"],
+                    "order_all": order_all,
+                    "votes": vote_strs,
+                    "model": name
                 }, ensure_ascii=False))
 
-    p=pathlib.Path(a.out_jsonl)
-    p.parent.mkdir(parents=True,exist_ok=True)
-    p.write_text("\n".join(out),encoding="utf-8")
-    print("✅ votes saved →",p)
+    p = pathlib.Path(a.out_jsonl)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text('\n'.join(out_lines), encoding="utf-8")
+    print("✅ votes saved →", p)
 
+# ─────────────────────────── CLI ──────────────────────────
 if __name__ == "__main__":
-    ap=argparse.ArgumentParser()
-    ap.add_argument("--pairs_jsonl",required=True)
-    ap.add_argument("--models_yaml",default="ordering/6_models.yaml")
-    ap.add_argument("--out_jsonl",required=True)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pairs_jsonl", required=True)
+    ap.add_argument("--models_yaml", default="ordering/6_models.yaml")
+    ap.add_argument("--out_jsonl",   required=True)
     main(ap.parse_args())
