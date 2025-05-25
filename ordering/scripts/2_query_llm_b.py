@@ -1,152 +1,162 @@
 #!/usr/bin/env python
 # ordering/scripts/2_query_llm_b.py
-# -------------------------------------------------------------
-# 4-문장 전체 순열(24) → LLM self-consistency   편향 최소화 버전
+# ------------------------------------------------------------------
+# 4 문장 전순열(24) → LLM self-consistency · 편향 최소화 버전
 #
-#   python 2_query_llm_b.py --pairs_jsonl ordering/data/pairs/test_all4_pairs.jsonl --out_jsonl ordering/data/votes/test_all4_votes.jsonl
-# -------------------------------------------------------------
+# 사용 예
+# python ordering/scripts/2_query_llm_b.py --pairs_jsonl ordering/data/pairs/test_all4_pairs.jsonl --out_jsonl ordering/data/votes/test_all4_votes.jsonl
+# ------------------------------------------------------------------
 import argparse, json, pathlib, random, re, statistics, itertools
 import yaml, requests
+from collections import defaultdict
 from tqdm.auto import tqdm
 
-# ───────────────────────────────── 프롬프트 ────────────────────────────────
+# ────────────────────────────── 프롬프트 ────────────────────────────────
 BASE_TEMPLATE = """\
-아래 네 문장은 하나의 글을 이룹니다. 문장 {L1},{L2},{L3},{L4} 를
-가장 자연스러운 순서(앞→뒤)로 배열하세요.
+아래 네 문장은 하나의 글을 구성합니다. {L1},{L2},{L3},{L4} 를
+읽는 사람이 가장 매끄럽게 이해할 수 있는 **앞→뒤** 순서로 재배열하세요.
 
-문장 {L1}: "{S1}"
-문장 {L2}: "{S2}"
-문장 {L3}: "{S3}"
-문장 {L4}: "{S4}"
+{L1}: "{S1}"
+{L2}: "{S2}"
+{L3}: "{S3}"
+{L4}: "{S4}"
 
-정답을 {L1}{L2}{L3}{L4} • {L1}{L2}{L4}{L3} … 과 같이
-{L1}{L2}{L3}{L4},{L1}{L2}{L4}{L3}, … ,{L4}{L3}{L2}{L1}
-***4글자 문자열*** 로 한 줄만 출력하세요.
-(예: {L2}{L1}{L3}{L4})
+정답은 네 글자의 문자열 한 줄로만 적어주세요.
+예) {L2}{L1}{L3}{L4}
 """
 
-PERM_4 = [''.join(p) for p in itertools.permutations("ABCD")]
+PERM_4     = {''.join(p) for p in itertools.permutations("ABCD")}
+perm_regex = re.compile(r"\b([ABCD]{4})\b")
 
-perm_pat = re.compile(r"\b([ABCD]{4})\b")
-
-# ───────────────────────────── util 함수 ───────────────────────────────────
-def load_pairs(path):
-    return [json.loads(l) for l in pathlib.Path(path).read_text("utf-8").splitlines()]
+# ────────────────────────── 헬퍼 함수들 ────────────────────────────────
+def load_pairs(path: str):
+    txt = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
+    return [json.loads(l) for l in txt]
 
 def build_prompt(rec, lbl_order):
-    """lbl_order=['C','A','D','B'] 처럼 임의 순서"""
-    lbl_map = dict(zip(lbl_order, "ABCD"))      # 실제→고정
-    sents = {l: rec[f"sent_{lbl_map[l].lower()}"] for l in lbl_order}
-    return BASE_TEMPLATE.format(
-        L1=lbl_order[0], L2=lbl_order[1],
-        L3=lbl_order[2], L4=lbl_order[3],
-        S1=sents[lbl_order[0]],
-        S2=sents[lbl_order[1]],
-        S3=sents[lbl_order[2]],
-        S4=sents[lbl_order[3]],
-    ), lbl_map
+    """
+    lbl_order 예: ['C','A','D','B']
+    반환: prompt, lbl_map(랜덤→정형 'ABCD')
+    """
+    lbl_map = {rnd: canon for rnd, canon in zip(lbl_order, "ABCD")}
+    prompt  = BASE_TEMPLATE.format(
+        L1=lbl_order[0], L2=lbl_order[1], L3=lbl_order[2], L4=lbl_order[3],
+        S1=rec[f"sent_{lbl_map[lbl_order[0]].lower()}"],
+        S2=rec[f"sent_{lbl_map[lbl_order[1]].lower()}"],
+        S3=rec[f"sent_{lbl_map[lbl_order[2]].lower()}"],
+        S4=rec[f"sent_{lbl_map[lbl_order[3]].lower()}"],
+    )
+    return prompt, lbl_map
 
-def extract_ans(txt):
-    m = perm_pat.search(txt.strip())
+def extract_perm(text: str):
+    """4-letter 순열을 찾아 PERM_4 안에 있으면 반환"""
+    m = perm_regex.search(text.strip())
     return m.group(1) if m and m.group(1) in PERM_4 else None
 
-def majority(votes):
-    valid = [v for v in votes if v]
-    if not valid:
+def majority(lst):
+    """동률이면 무작위"""
+    if not lst:
         return None
     try:
-        return statistics.mode(valid)
-    except statistics.StatisticsError:          # tie
-        return random.choice(valid)
+        return statistics.mode(lst)
+    except statistics.StatisticsError:
+        return random.choice(lst)
 
 def call_llm(server, model, prompts, n, temp, top_p, timeout=120):
+    """vLLM /v1/completions 호출"""
+    url  = server.rstrip('/') + '/v1/completions'
     body = {
         "model": model,
         "prompt": prompts if len(prompts) > 1 else prompts[0],
-        "max_tokens": 12,
+        "max_tokens": 20,                 # ### NEW: 여유 확보
         "temperature": temp,
         "top_p": top_p,
-        "n": n,
+        "n": n
     }
-    url = server.rstrip("/") + "/v1/completions"
-    r   = requests.post(url, json=body, timeout=timeout)
+    r = requests.post(url, json=body, timeout=timeout)
     r.raise_for_status()
     data = r.json()
     blocks = data if isinstance(data, list) else [data]
     return [[c["text"] for c in blk["choices"]] for blk in blocks]
 
-def order_from_str(order_str, lbl_map, rec):
-    """order_str 예: 'CADB' → 원본 인덱스 순서(list[int])"""
+def order_from_perm(perm_str, lbl_map, rec):
+    """LLM 출력 perm_str → 원본 인덱스 리스트"""
     letter2idx = {"A": rec["idx_a"], "B": rec["idx_b"],
                   "C": rec["idx_c"], "D": rec["idx_d"]}
-    # order_str 은 무작위 라벨을 그대로 사용 → lbl_map 로 변환
-    canonical = ''.join(lbl_map[ch] for ch in order_str)
+    canonical  = ''.join(lbl_map[ch] for ch in perm_str)  # 무작위→정형
     return [letter2idx[ch] for ch in canonical]
 
-# ─────────────────────────────── main ─────────────────────────────────────
-def main(a):
-    models = yaml.safe_load(open(a.models_yaml, encoding="utf-8"))["models"]
-    pairs  = load_pairs(a.pairs_jsonl)
+# ──────────────────────────── 메인 루프 ────────────────────────────────
+def main(args):
+    # 데이터 로드
+    pairs  = load_pairs(args.pairs_jsonl)
+    models = yaml.safe_load(open(args.models_yaml, encoding="utf-8"))["models"]
 
     out_lines = []
+
     for m in models:
-        name = m["name"]; model = m["hf_id"]; server = m["server_url"]
-        bs = int(m.get("batch_size", 1))
-        n_sample = int(m.get("n_sample", 32))
-        n_view   = int(m.get("n_view",   5))      # 라벨 무작위 view 수
-        temp = float(m.get("temperature", 0.8)); top_p = float(m.get("top_p", 0.9))
+        name      = m["name"]
+        model     = m["hf_id"]
+        server    = m["server_url"]
+        bs        = int(m.get("batch_size", 1))
+        n_sample  = int(m.get("n_sample", 8))   # ### NEW: 뷰·샘플 균형
+        n_view    = int(m.get("n_view",   8))   # ### NEW: view ↑
+        temp      = float(m.get("temperature", 0.8))
+        top_p     = float(m.get("top_p", 0.95))
 
         print(f"\n⚙️ {model} | batch={bs} | n_sample={n_sample} | view={n_view}")
+
         for i in tqdm(range(0, len(pairs), bs),
-                      total=(len(pairs) + bs - 1)//bs,
+                      total=(len(pairs)+bs-1)//bs,
                       desc=name):
             batch_recs = pairs[i:i+bs]
 
-            # view 별 프롬프트 생성
-            prompts, view_maps = [], []
+            # ------ 프롬프트 생성 (rec × view) ----------------------
+            prompts       = []
+            prompt_infos  = []   # [(rec obj, lbl_map)]  순서 일치
             for rec in batch_recs:
-                for v in range(n_view):
-                    lbl_order = random.sample("ABCD", 4)
-                    ptxt, mp = build_prompt(rec, lbl_order)
-                    prompts.append(ptxt)
-                    view_maps.append((rec, mp))
-
-            # LLM 호출 (view*bs 개)
-            reps = call_llm(server, model, prompts,
-                            n_sample, temp, top_p)
-            # 납작 리스트로 정렬
-            flat_reps = [t for sub in reps for t in sub]
-
-            # 결과 집계
-            ptr = 0
-            for rec in batch_recs:
-                votes = []
                 for _ in range(n_view):
-                    ans_list = flat_reps[ptr: ptr + n_sample]
-                    rec_, mp = view_maps[ptr // n_sample]
-                    ptr += n_sample
-                    for txt in ans_list:
-                        s = extract_ans(txt)
-                        if s:
-                            votes.append(order_from_str(s, mp, rec_))
-                # Canonical tuple 로 majority
-                vote_strs = ['-'.join(map(str, v)) for v in votes]
-                best = majority(vote_strs)
-                order_all = list(map(int, best.split('-'))) if best else None
+                    lbl_order = random.sample("ABCD", 4)
+                    ptxt, mp  = build_prompt(rec, lbl_order)
+                    prompts.append(ptxt)
+                    prompt_infos.append((rec, mp))      ### NEW: 정확 매핑
+
+            # ------ LLM 호출 ---------------------------------------
+            replies_nested = call_llm(server, model, prompts,
+                                      n_sample, temp, top_p)
+            # 납작 리스트 (prompt 순서 유지)
+            flat_reps = [txt for block in replies_nested for txt in block]
+
+            # ------ 결과 집계 ---------------------------------------
+            votes_per_id = defaultdict(list)
+
+            for pi, txt in enumerate(flat_reps):
+                rec, mp = prompt_infos[pi // n_sample]   # ### FIX: 인덱스 정확
+                perm    = extract_perm(txt)
+                if perm:
+                    order = order_from_perm(perm, mp, rec)
+                    votes_per_id[rec["ID"]].append('-'.join(map(str, order)))
+
+            # ---- batch_recs 순서대로 저장 ----
+            for rec in batch_recs:
+                id_   = rec["ID"]
+                votes = votes_per_id[id_]
+                choice = majority(votes)
+                order_all = list(map(int, choice.split('-'))) if choice else None
 
                 out_lines.append(json.dumps({
-                    "ID": rec["ID"],
+                    "ID": id_,
                     "order_all": order_all,
-                    "votes": vote_strs,
+                    "votes": votes,
                     "model": name
                 }, ensure_ascii=False))
 
-    p = pathlib.Path(a.out_jsonl)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text('\n'.join(out_lines), encoding="utf-8")
-    print("✅ votes saved →", p)
+    out_path = pathlib.Path(args.out_jsonl)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text('\n'.join(out_lines), encoding='utf-8')
+    print("✅ votes saved →", out_path)
 
-# ─────────────────────────── CLI ──────────────────────────
+# ─────────────────────────────── CLI ────────────────────────────────
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--pairs_jsonl", required=True)
